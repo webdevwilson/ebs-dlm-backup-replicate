@@ -1,0 +1,158 @@
+Description: 'Creates pruning lambda in the replication region, prunes based on source_volume tag'
+
+Parameters:
+
+  SnapshotRetention:
+    Description: 'How many snapshots to retain'
+    Type: String
+
+  LogRetentionInDays:
+    Description: 'How long to retain the logs'
+    Type: String
+    Default: 30
+
+Resources:
+
+  # Create role for the pruner
+  PruningLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'snapshot-repl-prune-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Path: '/'
+      Policies:
+        - PolicyName: 'root'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:DeleteSnapshot'
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}::snapshot/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:DescribeSnapshots'
+                Resource: '*'
+
+  # Create the lambda function
+  PruningLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'snapshot-pruner'
+      Handler: 'index.handler'
+      Runtime: 'python3.6'
+      Role: !GetAtt PruningLambdaRole.Arn
+      MemorySize: 256
+      Timeout: 900
+      Environment:
+        Variables:
+          SNAPSHOT_RETENTION: !Ref SnapshotRetention
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          import operator
+
+          SNAPSHOT_RETENTION=int(os.getenv('SNAPSHOT_RETENTION'))
+
+          logger=logging.getLogger(__name__)
+          logger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+
+          def handler(event, _):
+            logger.info('Event: {}'.format(json.dumps(event)))
+            snapshot_id = event['detail']['snapshot_id'].split('/')[1]
+
+            ec2 = boto3.client('ec2')
+
+            # get snapshot source
+            tags = boto3.resource('ec2').Snapshot(snapshot_id).tags
+            source_volume = None
+            if tags:
+              for tag in tags:
+                if tag['Key'] == 'source_volume':
+                  source_volume = tag['Value']
+                  break
+
+            # Did not find a source volume id
+            if not source_volume:
+              logger.warn('No source volume id for snapshot {}'.format(snapshot_id))
+            else:
+              logger.info('Pruning snapshots for volume \'{}\''.format(source_volume))
+
+              # query for snapshot by volume id
+              paginator = ec2.get_paginator('describe_snapshots')
+
+              snapshots = []
+              snapshot_iter = paginator.paginate(
+                Filters=[
+                  {'Name': 'tag:source_volume', 'Values': [source_volume]}
+                ]
+              )
+
+              # collect all the snapshot id's with start time
+              for page in snapshot_iter:
+                snapshots.extend(
+                  map(lambda x : {
+                    'SnapshotId': x['SnapshotId'],
+                    'StartTime': x['StartTime']
+                  }, page['Snapshots'])
+                )
+
+              # sort list by start time
+              snapshots.sort(key=operator.itemgetter('StartTime'), reverse=True)
+
+              delete_snaps = snapshots[SNAPSHOT_RETENTION:]
+
+              logger.info('Found {} snapshots: {}'.format(len(snapshots), snapshots))
+              logger.info('Found {} snapshots to delete: {}'.format(len(delete_snaps), delete_snaps))
+
+              # Delete the snapshots
+              for s in delete_snaps:
+                boto3.resource('ec2').Snapshot(s['SnapshotId']).delete()
+
+
+  # Set log retention
+  PruningLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PruningLambdaFunction}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # Create rule that fires when a snapshot is created successfully
+  PruningLambdaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'snapshot-created'
+      Description: 'Fires when snapshot is successful'
+      EventPattern:
+        source: ['aws.ec2']
+        detail-type: ['EBS Snapshot Notification']
+        detail:
+          event: ['copySnapshot']
+          result: ['succeeded']
+      State: 'ENABLED'
+      Targets:
+        - Id: 'triggerLambda'
+          Arn: !GetAtt PruningLambdaFunction.Arn
+
+  # Allow cloudwatch events to invoke the lambda
+  PruningLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PruningLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt PruningLambdaRule.Arn

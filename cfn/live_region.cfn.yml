@@ -1,0 +1,215 @@
+Description: 'Creates DLM policy as well as lambda that will copy the snapshot to the DR region'
+
+Parameters:
+
+  ReplicationRegion:
+    Description: 'Which region to replicate to?'
+    Type: String
+
+  ReplicationTag:
+    Description: 'What tag marks a snapshot for replication'
+    Type: String
+    Default: 'replicate'
+
+  ReplicationTagValue:
+    Description: 'What value should the snapshot tag have?'
+    Type: String
+    Default: 'true'
+
+  SnapshotRetention:
+    Description: 'How many snapshots to retain'
+    Type: String
+
+  LogRetentionInDays:
+    Description: 'How long to retain the logs'
+    Type: String
+    Default: 30
+
+Resources:
+
+  # Create a role for DLM to use
+  DlmLifecycleRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'dlm-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'dlm.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole']
+
+  # Create the lifecycle policy
+  DlmLifecyclePolicy:
+    Type: 'AWS::DLM::LifecyclePolicy'
+    Properties:
+      Description: 'Lifecycle Policy using CloudFormation'
+      State: 'ENABLED'
+      ExecutionRoleArn: !GetAtt DlmLifecycleRole.Arn
+      PolicyDetails:
+        ResourceTypes: ['VOLUME']
+        TargetTags:
+          - Key: 'snapshot'
+            Value: 'true'
+        Schedules:
+          - Name: '2 weeks of daily snapshots'
+            TagsToAdd:
+              - Key: 'type'
+                Value: 'daily'
+              - Key: !Ref ReplicationTag
+                Value: !Ref ReplicationTagValue
+            CreateRule:
+              Interval: 24
+              IntervalUnit: 'HOURS'
+              Times:
+                - '13:00'
+            RetainRule:
+              Count: !Ref SnapshotRetention
+            CopyTags: True
+
+  # Create role for the pruner
+  ReplicationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'snapshot-replicate-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Path: '/'
+      Policies:
+        - PolicyName: 'root'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:CopySnapshot'
+                  - 'ec2:DescribeSnapshots'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:CreateTags'
+                Resource:
+                  - !Sub 'arn:aws:ec2:${AWS::Region}::snapshot/*'
+                  - !Sub 'arn:aws:ec2:${ReplicationRegion}::snapshot/*'
+
+  # Create the lambda function
+  ReplicationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'snapshot-replicator'
+      Handler: 'index.handler'
+      Runtime: 'python3.6'
+      Role: !GetAtt ReplicationLambdaRole.Arn
+      MemorySize: 256
+      Timeout: 900
+      Environment:
+        Variables:
+          REPLICATION_REGION: !Ref ReplicationRegion
+          REPLICATION_TAG: !Ref ReplicationTag
+          REPLICATION_TAG_VALUE: !Ref ReplicationTagValue
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          REPLICATION_REGION=os.getenv('REPLICATION_REGION')
+          REPLICATION_TAG=os.getenv('REPLICATION_TAG', 'replicate')
+          REPLICATION_TAG_VALUE=os.getenv('REPLICATION_TAG_VALUE', 'true')
+
+          logger=logging.getLogger(__name__)
+          logger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+
+          def handler(event, _):
+            logger.info('Event: {}'.format(json.dumps(event)))
+            snapshot_id = event['detail']['snapshot_id'].split('/')[1]
+            volume_arn = event['detail']['source']
+            logger.info('Replicating snapshot \'{}\' of \'{}\' to {}'.format(snapshot_id, volume_arn, REPLICATION_REGION))
+
+            ec2_live = boto3.client('ec2')
+            ec2_dr   = boto3.client('ec2', region_name=REPLICATION_REGION)
+
+            # Tag snapshot with volume arn
+            resp = ec2_live.create_tags(
+              Resources=[snapshot_id],
+              Tags=[
+                {'Key': 'source_volume', 'Value': volume_arn}
+              ]
+            )
+            logger.info('Create tags resp: {}'.format(resp))
+
+            tags = boto3.resource('ec2').Snapshot(snapshot_id).tags
+
+            # Check for replication tag
+            replication_tag = next(item for item in tags if item['Key'] == REPLICATION_TAG)
+            if replication_tag and replication_tag['Value'] == REPLICATION_TAG_VALUE:
+
+              # Copy snapshot to DR region
+              resp = ec2_dr.copy_snapshot(
+                SourceRegion=os.getenv('AWS_REGION'),
+                SourceSnapshotId=snapshot_id
+              )
+              new_snapshot_id = resp['SnapshotId']
+
+              # Get snapshot tags and add to new snapshot in other region including ARN of this snapshot
+              tags.append({'Key': 'source_snapshot', 'Value': event['detail']['snapshot_id']})
+
+              # Remove aws: reserved tags
+              tags = list(filter(lambda t: not t['Key'].startswith('aws:'), tags))
+
+              # Tag the copied snapshot
+              logging.info('Tagging snapshot \'{}\' with {}'.format(new_snapshot_id, tags))
+              ec2_dr.create_tags(
+                Resources=[new_snapshot_id],
+                Tags=tags
+              )
+
+            else:
+              logger.info('Not replicating snapshot {}, no replication tag'.format(snapshot_id))
+
+  # Set log retention
+  ReplicationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ReplicationLambdaFunction}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # Create rule that fires when a snapshot is created successfully
+  ReplicationLambdaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'snapshot-created'
+      Description: 'Fires when snapshot is successful'
+      EventPattern:
+        source: ['aws.ec2']
+        detail-type: ['EBS Snapshot Notification']
+        detail:
+          event: ['createSnapshot']
+          result: ['succeeded']
+      State: 'ENABLED'
+      Targets:
+        - Id: 'triggerLambda'
+          Arn: !GetAtt ReplicationLambdaFunction.Arn
+
+  # Allow cloudwatch events to invoke the lambda
+  ReplicationLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReplicationLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt ReplicationLambdaRule.Arn
